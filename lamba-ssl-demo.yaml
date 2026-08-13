@@ -1,0 +1,405 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS CloudFormation template deploying a private Lambda function, S3 bucket,
+  and S3 VPC Endpoint with SSL certificate inspection capabilities. (v1.0.3 - Captured Response Body)
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Select the existing VPC where the Lambda function and VPC Endpoint will be deployed.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Select private subnets for the Lambda function.
+
+  RouteTableIds:
+    Type: List<String>
+    Description: Comma-separated list of Route Table IDs associated with the private subnets (e.g. rtb-0123456789abcdef0).
+
+  S3BucketName:
+    Type: String
+    Default: ""
+    Description: >
+      Optional custom name for the S3 bucket. Must be globally unique across AWS.
+      Leave blank to let CloudFormation automatically generate a unique name.
+
+  CustomCertificatePem:
+    Type: String
+    Default: ""
+    MaxLength: 4096
+    NoEcho: true
+    Description: >
+      [OPTIONAL] Paste PEM or CER root/intermediate CA certificate content (<4096 chars).
+      If left blank, deploy stack first, then upload ZscalerRootCertificate-2048-SHA256-Feb2025.crt directly to the created S3 bucket.
+
+Conditions:
+  HasCustomCert: !Not [!Equals [!Ref CustomCertificatePem, ""]]
+  HasBucketName: !Not [!Equals [!Ref S3BucketName, ""]]
+
+Resources:
+  S3VPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds: !Ref RouteTableIds
+
+  CertBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If [HasBucketName, !Ref S3BucketName, !Ref "AWS::NoValue"]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  CertBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CertBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: RestrictToVpceAndAccountPrincipals
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:aws:s3:::${CertBucket}"
+              - !Sub "arn:aws:s3:::${CertBucket}/*"
+            Condition:
+              StringNotEquals:
+                aws:sourceVpce: !Ref S3VPCEndpoint
+              ArnNotLike:
+                aws:PrincipalArn:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:root"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:user/*"
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for private URL checker Lambda function
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic for URL checking
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${CertBucket}"
+                  - !Sub "arn:aws:s3:::${CertBucket}/*"
+
+  S3ProvisionerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3PutPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${CertBucket}/*"
+
+  S3ProvisionerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt S3ProvisionerRole.Arn
+      Runtime: python3.11
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import urllib.request
+          import boto3
+
+          s3 = boto3.client('s3')
+
+          BOOTSTRAP_SCRIPT = """#!/bin/bash
+          set -e
+          echo "=== Bootstrap script executed successfully ==="
+          """
+
+          def send_cfn_response(event, context, response_status, response_data=None):
+              response_body = json.dumps({
+                  'Status': response_status,
+                  'Reason': f'See CloudWatch Logs: {context.log_stream_name}',
+                  'PhysicalResourceId': context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': response_data or {}
+              }).encode('utf-8')
+              req = urllib.request.Request(
+                  event['ResponseURL'],
+                  data=response_body,
+                  headers={'content-type': '', 'content-length': str(len(response_body))},
+                  method='PUT'
+              )
+              urllib.request.urlopen(req)
+
+          def handler(event, context):
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      bucket_name = event['ResourceProperties']['BucketName']
+                      cert_content = event['ResourceProperties'].get('CustomCert', '')
+
+                      # 1. Write bootstrap.sh
+                      s3.put_object(
+                          Bucket=bucket_name,
+                          Key='bootstrap.sh',
+                          Body=BOOTSTRAP_SCRIPT.encode('utf-8')
+                      )
+
+                      # 2. Write custom-ca.pem if provided
+                      if cert_content and cert_content.strip():
+                          s3.put_object(
+                              Bucket=bucket_name,
+                              Key='custom-ca.pem',
+                              Body=cert_content.strip().encode('utf-8')
+                          )
+
+                  send_cfn_response(event, context, 'SUCCESS')
+              except Exception as e:
+                  print(f"Error in S3 provisioner: {str(e)}")
+                  send_cfn_response(event, context, 'FAILED', {'Error': str(e)})
+
+  S3ProvisionerCustomResource:
+    Type: Custom::S3Provisioner
+    Properties:
+      ServiceToken: !GetAtt S3ProvisionerFunction.Arn
+      BucketName: !Ref CertBucket
+      CustomCert: !Ref CustomCertificatePem
+
+  URLCheckerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: S3ProvisionerCustomResource
+    Properties:
+      FunctionName: URLStatusChecker
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.11
+      Timeout: 30
+      MemorySize: 256
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+      Environment:
+        Variables:
+          CERT_BUCKET: !Ref CertBucket
+          TEMPLATE_VERSION: "1.0.3"
+      Tags:
+        - Key: Name
+          Value: URLStatusChecker
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: SecurityInspection
+          Value: Enabled
+      Code:
+        ZipFile: |
+          import os
+          import re
+          import ssl
+          import urllib.request
+          import json
+          import boto3
+
+          # Version 1.0.3 - Returned Response Body Support
+          S3_BUCKET = os.environ['CERT_BUCKET']
+          TRUST_STORE_PATH = '/tmp/custom-ca-bundle.pem'
+
+          def extract_pem_certificates(raw_bytes: bytes) -> str:
+              """Decodes raw bytes and returns valid PEM certificate blocks."""
+              try:
+                  text = raw_bytes.decode('utf-8-sig', errors='replace')
+              except Exception:
+                  text = raw_bytes.decode('latin-1', errors='replace')
+
+              text = text.replace('\r\n', '\n')
+
+              # 1. Match standard ASCII PEM blocks
+              pem_blocks = re.findall(r'-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----', text)
+              if pem_blocks:
+                  print(f"Successfully extracted {len(pem_blocks)} PEM certificate block(s).")
+                  return "\n".join(pem_blocks) + "\n"
+
+              # 2. Fallback: Check if file is binary DER format
+              try:
+                  pem_str = ssl.DER_cert_to_PEM_cert(raw_bytes)
+                  print("Converted binary DER certificate to PEM format.")
+                  return pem_str + "\n"
+              except Exception:
+                  pass
+
+              # 3. Fallback: Check if file is raw base64 string without headers
+              try:
+                  import base64
+                  clean_b64 = re.sub(r'\s+', '', text)
+                  decoded_der = base64.b64decode(clean_b64, validate=True)
+                  pem_str = ssl.DER_cert_to_PEM_cert(decoded_der)
+                  print("Converted raw Base64 DER string to PEM format.")
+                  return pem_str + "\n"
+              except Exception:
+                  pass
+
+              print("WARNING: Could not parse certificate file into valid PEM format.")
+              return ""
+
+          def get_system_ca_path():
+              paths = ssl.get_default_verify_paths()
+              if paths.cafile and os.path.exists(paths.cafile):
+                  return paths.cafile
+              for candidate in ['/etc/pki/tls/certs/ca-bundle.crt', '/etc/ssl/certs/ca-certificates.crt', '/etc/ssl/cert.pem']:
+                  if os.path.exists(candidate):
+                      return candidate
+              return None
+
+          def find_cert_file(s3_client, bucket):
+              try:
+                  s3_client.head_object(Bucket=bucket, Key='custom-ca.pem')
+                  return 'custom-ca.pem'
+              except Exception:
+                  pass
+
+              response = s3_client.list_objects_v2(Bucket=bucket)
+              if 'Contents' in response:
+                  for obj in response['Contents']:
+                      key = obj['Key']
+                      if key.lower().endswith(('.crt', '.pem', '.cer')) and key != 'bootstrap.sh':
+                          return key
+              return None
+
+          def build_trust_store():
+              print("=== Cold Start: Building custom CA trust store (v1.0.3) ===")
+              s3 = boto3.client('s3')
+
+              ca_content = ""
+              sys_ca = get_system_ca_path()
+              if sys_ca:
+                  print(f"Loading system CA bundle from: {sys_ca}")
+                  with open(sys_ca, 'r') as f:
+                      ca_content += f.read() + "\n"
+
+              cert_key = find_cert_file(s3, S3_BUCKET)
+              if cert_key:
+                  print(f"Found certificate file in S3: {cert_key}")
+                  obj = s3.get_object(Bucket=S3_BUCKET, Key=cert_key)
+                  raw_bytes = obj['Body'].read()
+
+                  extracted_pem = extract_pem_certificates(raw_bytes)
+                  if extracted_pem:
+                      ca_content += "\n# --- Custom Firewall / Zscaler Root CA ---\n" + extracted_pem + "\n"
+                  else:
+                      print(f"ERROR: Failed to extract valid certificate content from S3 object '{cert_key}'.")
+              else:
+                  print("WARNING: No custom certificate file (.crt, .pem, .cer) found in S3 bucket.")
+
+              with open(TRUST_STORE_PATH, 'w') as f:
+                  f.write(ca_content)
+
+              os.environ['SSL_CERT_FILE'] = TRUST_STORE_PATH
+              os.environ['AWS_CA_BUNDLE'] = TRUST_STORE_PATH
+              os.environ['REQUESTS_CA_BUNDLE'] = TRUST_STORE_PATH
+              print(f"Trust store successfully written to {TRUST_STORE_PATH} ({os.path.getsize(TRUST_STORE_PATH)} bytes)")
+
+          # Initialize trust store on cold start
+          try:
+              build_trust_store()
+          except Exception as e:
+              print(f"ERROR during cold-start trust store creation: {str(e)}")
+
+          def lambda_handler(event, context):
+              url = event.get('url', 'https://ipinfo.io')
+              print(f"Testing URL connectivity & SSL inspection: {url}")
+
+              try:
+                  ssl_context = ssl.create_default_context(cafile=TRUST_STORE_PATH)
+
+                  req = urllib.request.Request(
+                      url,
+                      headers={'User-Agent': 'AWS-Lambda-URL-Status-Checker/1.0'}
+                  )
+
+                  with urllib.request.urlopen(req, context=ssl_context, timeout=15) as response:
+                      status_code = response.getcode()
+                      headers = dict(response.info())
+                      raw_body = response.read()
+
+                      # Try parsing JSON first; fallback to text (truncated if >4000 chars)
+                      try:
+                          response_body = json.loads(raw_body.decode('utf-8'))
+                      except Exception:
+                          try:
+                              decoded_text = raw_body.decode('utf-8', errors='replace')
+                              response_body = decoded_text[:4000] + ("... (truncated)" if len(decoded_text) > 4000 else "")
+                          except Exception:
+                              response_body = "<binary content>"
+
+                      return {
+                          'statusCode': status_code,
+                          'url': url,
+                          'message': f"Successfully connected to {url}",
+                          'trustStoreUsed': TRUST_STORE_PATH,
+                          'responseBody': response_body,
+                          'responseHeaders': headers
+                      }
+              except Exception as e:
+                  print(f"SSL Verification / Connection Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'url': url,
+                      'error': str(e),
+                      'message': f"Failed to connect to {url}. Ensure Zscaler Root & Intermediate CAs are present in S3.",
+                      'trustStoreUsed': TRUST_STORE_PATH
+                  }
+
+Outputs:
+  CertBucketName:
+    Description: Name of the created private S3 bucket
+    Value: !Ref CertBucket
+
+  LambdaFunctionName:
+    Description: Name of the URL Status Checker Lambda function
+    Value: !Ref URLCheckerFunction
