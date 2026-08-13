@@ -58,7 +58,12 @@ Upload your firewall root/intermediate CA certificate to the newly created S3 bu
     
 2.  Select the function named URLStatusChecker (do not select S3ProvisionerFunction).
     
-3.  Under the **Test** tab, create a test event with the target URL:
+3.  Under the **Test** tab, create a test event with the target URL: in JSON format e.g.
+
+{
+  "url": "https://ip.zscaler.com/?json"
+}
+
     
 4.  Click **Test**. Successful execution returns statusCode: 200, the container's private IP, and the parsed response body:
     
